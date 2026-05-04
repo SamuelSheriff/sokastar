@@ -1,19 +1,25 @@
-{
-  "name": "sokastar-webhook-server",
-  "version": "1.0.0",
-  "description": "Instasend webhook receiver for Sokastar Admin Dashboard",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
-}
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Use JSON middleware to parse the payload
+app.use(express.json());
+
+app.post('/webhook/instasend', (req, res) => {
+    const payload = req.body;
+    
+    // 1. Log the event type (e.g., 'payment.completed')
+    console.log('Received webhook:', payload.event_type);
+
+    // 2. TODO: Verify signature here
+
+    // 3. Acknowledge receipt immediately
+    res.status(200).send('Webhook Received');
+
+    // 4. Perform async logic (Update Sokastar Admin Dashboard)
+    // handlePaymentUpdate(payload);
+});
+
+app.listen(PORT, () => {
+    console.log(`Sokastar Webhook Server running on port ${PORT}`);
+});  
