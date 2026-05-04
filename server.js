@@ -4,23 +4,22 @@
  * Receives payment notifications from Instasend and stores them
  * so the dashboard can pull them in real time.
  *
- * Deploy on: Railway, Render, Fly.io, or any Node.js host.
- * Set your Instasend webhook URL to: https://YOUR_DOMAIN/webhook/instasend
+ * Deploy on: Railway, Render, Fly.io, etc.
+ * Webhook URL: https://YOUR_DOMAIN/webhook/instasend
  */
 
 const express = require('express');
-const crypto  = require('crypto');
-const fs      = require('fs');
-const path    = require('path');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Config ────────────────────────────────────────────────────────────────────
-// Set these as environment variables on your host — never hardcode secrets.
 const INSTASEND_WEBHOOK_SECRET = process.env.INSTASEND_WEBHOOK_SECRET || '';
-const ADMIN_API_KEY            = process.env.ADMIN_API_KEY || 'change-this-secret-key';
-const DB_FILE                  = path.join(__dirname, 'transactions.json');
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'change-this-secret-key';
+const DB_FILE = path.join(__dirname, 'transactions.json');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function loadTransactions() {
@@ -42,12 +41,9 @@ function saveTransactions(txns) {
   }
 }
 
-/**
- * Verify the Instasend HMAC-SHA256 signature.
- * Instasend sends the signature in the `X-Instasend-Signature` header.
- */
+// Verify Instasend webhook signature
 function verifySignature(rawBody, signature) {
-  if (!INSTASEND_WEBHOOK_SECRET) return true; // skip if secret not configured
+  if (!INSTASEND_WEBHOOK_SECRET) return true; // Skip verification if secret not set
   const expected = crypto
     .createHmac('sha256', INSTASEND_WEBHOOK_SECRET)
     .update(rawBody)
@@ -58,41 +54,26 @@ function verifySignature(rawBody, signature) {
   );
 }
 
-/**
- * Map an Instasend M-Pesa payload to the Sokastar transaction schema.
- *
- * Instasend STK Push / B2C callback structure (key fields):
- * {
- *   invoice: {
- *     invoice_id, state,           // "COMPLETE" | "PENDING" | "FAILED"
- *     mpesa_reference,             // M-Pesa transaction code e.g. "SIH7X89ZKQ"
- *     net_amount,                  // amount paid
- *     currency,
- *     created_at,
- *     customer: { phone_number, first_name, last_name, email }
- *   }
- * }
- */
+// Map Instasend payload to your schema
 function mapInstasendPayload(body) {
-  const invoice  = body.invoice || body;                      // handle both shapes
+  const invoice = body.invoice || body;
   const customer = invoice.customer || {};
-  const phone    = (customer.phone_number || '').replace(/^\+254/, '0'); // normalise to 07xx
-  const mpesa    = (invoice.mpesa_reference || invoice.reference || '').toUpperCase();
-  const amount   = parseFloat(invoice.net_amount || invoice.amount || 0);
-  const state    = (invoice.state || '').toUpperCase();
-  const rawDate  = invoice.created_at ? new Date(invoice.created_at) : new Date();
-  const date     = rawDate.toISOString().split('T')[0];
-  const time     = rawDate.toTimeString().slice(0, 5);
+  const phone = (customer.phone_number || '').replace(/^\+254/, '0');
+  const mpesa = (invoice.mpesa_reference || invoice.reference || '').toUpperCase();
+  const amount = parseFloat(invoice.net_amount || invoice.amount || 0);
+  const state = (invoice.state || '').toUpperCase();
+  const rawDate = invoice.created_at ? new Date(invoice.created_at) : new Date();
+  const date = rawDate.toISOString().split('T')[0];
+  const time = rawDate.toTimeString().slice(0, 5);
 
   return { phone, mpesa, amount, state, date, time };
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-// Parse raw body first (needed for signature verification)
 app.use('/webhook/instasend', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
-// CORS — allow your dashboard origin
+// CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Api-Key');
@@ -103,16 +84,13 @@ app.use((req, res, next) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-/**
- * POST /webhook/instasend
- * Instasend calls this URL after every payment event.
- */
+/** Instasend Webhook */
 app.post('/webhook/instasend', (req, res) => {
-  const rawBody  = req.body;                          // Buffer (raw middleware)
-  const bodyStr  = rawBody.toString('utf8');
-  const sig      = req.headers['x-instasend-signature'] || '';
+  const rawBody = req.body; // Buffer from express.raw
+  const bodyStr = rawBody.toString('utf8');
+  const sig = req.headers['x-instasend-signature'] || '';
 
-  // 1. Verify signature
+  // Verify signature
   if (!verifySignature(bodyStr, sig)) {
     console.warn('Webhook signature mismatch — rejected');
     return res.status(401).json({ error: 'Invalid signature' });
@@ -129,45 +107,46 @@ app.post('/webhook/instasend', (req, res) => {
 
   const { phone, mpesa, amount, state, date, time } = mapInstasendPayload(payload);
 
-  // 2. Only store COMPLETE payments
+  // Only store successful payments
   if (state !== 'COMPLETE' && state !== 'COMPLETED') {
     console.log(`Ignored — state is "${state}"`);
     return res.status(200).json({ status: 'ignored', reason: `state=${state}` });
   }
 
-  // 3. Validate minimum fields
+  // Basic validation
   if (!phone || !mpesa || amount <= 0) {
     console.warn('Webhook payload missing required fields', { phone, mpesa, amount });
     return res.status(422).json({ error: 'Missing required fields' });
   }
 
-  // 4. Deduplicate by M-Pesa code
+  // Deduplication
   const txns = loadTransactions();
   if (txns.some(t => t.mpesa === mpesa)) {
     console.log(`Duplicate M-Pesa code ${mpesa} — skipped`);
     return res.status(200).json({ status: 'duplicate' });
   }
 
-  // 5. Infer package from amount (customise thresholds as needed)
+  // Infer package
   const pkgMap = [
     { min: 240, max: 260, name: 'Daily' },
-    { min: 45,  max: 55,  name: 'Super MultiBet' },
-    { min: 35,  max: 45,  name: 'MidWeek Jackpot' },
-    { min: 75,  max: 85,  name: 'Mega Jackpot' },
-    { min: 15,  max: 25,  name: 'Half Time Full Time' },
+    { min: 45, max: 55, name: 'Super MultiBet' },
+    { min: 35, max: 45, name: 'MidWeek Jackpot' },
+    { min: 75, max: 85, name: 'Mega Jackpot' },
+    { min: 15, max: 25, name: 'Half Time Full Time' },
   ];
+
   const inferredPkg = (pkgMap.find(p => amount >= p.min && amount <= p.max) || {}).name || 'Unknown';
 
   const newTx = {
-    id:      Date.now(),
+    id: Date.now(),
     phone,
     mpesa,
     amount,
     package: inferredPkg,
     date,
     time,
-    notes:   'Auto — Instasend webhook',
-    source:  'instasend',
+    notes: 'Auto — Instasend webhook',
+    source: 'instasend',
   };
 
   txns.push(newTx);
@@ -177,12 +156,7 @@ app.post('/webhook/instasend', (req, res) => {
   res.status(200).json({ status: 'ok', transaction: newTx });
 });
 
-
-/**
- * GET /api/transactions
- * Dashboard polls this to pull in webhook-sourced transactions.
- * Protected by a simple API key header: X-Api-Key
- */
+/** Get transactions (for dashboard) */
 app.get('/api/transactions', (req, res) => {
   const key = req.headers['x-api-key'] || req.query.key;
   if (key !== ADMIN_API_KEY) {
@@ -192,36 +166,35 @@ app.get('/api/transactions', (req, res) => {
   res.json({ transactions: txns, count: txns.length });
 });
 
-
-/**
- * DELETE /api/transactions/:id
- * Dashboard delete button support via API.
- */
+/** Delete transaction */
 app.delete('/api/transactions/:id', (req, res) => {
   const key = req.headers['x-api-key'] || req.query.key;
-  if (key !== ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (key !== ADMIN_API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
 
-  const id   = parseInt(req.params.id, 10);
-  let txns   = loadTransactions();
+  const id = parseInt(req.params.id, 10);
+  let txns = loadTransactions();
   const before = txns.length;
   txns = txns.filter(t => t.id !== id);
 
-  if (txns.length === before) return res.status(404).json({ error: 'Not found' });
+  if (txns.length === before) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
   saveTransactions(txns);
   res.json({ status: 'deleted' });
 });
 
-
-/**
- * GET /health
- * Simple health check for uptime monitors.
- */
+/** Health check */
 app.get('/health', (_, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-
-app.listen(PORT, () => {
+// ── Start Server ──────────────────────────────────────────────────────────────
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Sokastar webhook server running on port ${PORT}`);
-  console.log(`   POST /webhook/instasend  ← Instasend webhook URL`);
-  console.log(`   GET  /api/transactions   ← Dashboard polling endpoint`);
-  console.log(`   ADMIN_API_KEY: ${ADMIN_API_KEY === 'change-this-secret-key' ? '⚠️  USING DEFAULT — SET ENV VAR!' : '✅ configured'}\n`);
+  console.log(`📡 POST /webhook/instasend  ← Instasend webhook URL`);
+  console.log(`📡 GET  /api/transactions   ← Dashboard polling`);
+  console.log(`🔑 ADMIN_API_KEY: ${ADMIN_API_KEY === 'change-this-secret-key' 
+    ? '⚠️  USING DEFAULT — CHANGE IT!' 
+    : '✅ configured'}\n`);
 });
